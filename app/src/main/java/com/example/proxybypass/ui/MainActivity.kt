@@ -81,7 +81,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        registerReceiver(stateReceiver, IntentFilter(ProxyVpnService.BROADCAST_STATE))
+        registerReceiver(stateReceiver, IntentFilter(ProxyVpnService.BROADCAST_STATE), Context.RECEIVER_NOT_EXPORTED)
     }
 
     override fun onPause() {

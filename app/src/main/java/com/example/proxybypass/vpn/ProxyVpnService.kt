@@ -94,7 +94,7 @@ class ProxyVpnService : VpnService() {
             // Android 10+ can hint the proxy to the VPN interface
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setMetered(false)
-                    .addProxyInfo(ProxyInfo.buildDirectProxy(proxyIp, proxyPort))
+                    .setHttpProxy(ProxyInfo.buildDirectProxy(proxyIp, proxyPort))
             }
 
             vpnInterface?.close()

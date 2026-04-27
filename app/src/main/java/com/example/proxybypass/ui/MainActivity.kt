@@ -28,41 +28,34 @@ class MainActivity : AppCompatActivity() {
     private val fetcher = ProxyFetcher()
 
     private var pendingProxy: Proxy? = null
-    private var isConnected = false
+    private var isConnected  = false
+    private var isConnecting = false   // true between Connect tap and first CONNECTED broadcast
 
-    // VPN permission launcher
     private val vpnPermLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == RESULT_OK) {
             pendingProxy?.let { startVpnService(it) }
         } else {
+            isConnecting = false
+            setConnectingUI(false)
             toast("VPN permission denied")
         }
     }
 
-    // Notification permission (Android 13+)
     private val notifPermLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { /* proceed regardless */ }
 
-    // Receive broadcasts from service
     private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val state = intent.getStringExtra(ProxyVpnService.EXTRA_STATE) ?: return
             val addr  = intent.getStringExtra(ProxyVpnService.EXTRA_PROXY_ADDR) ?: ""
             val ping  = intent.getLongExtra(ProxyVpnService.EXTRA_PING, 0)
             val speed = intent.getStringExtra(ProxyVpnService.EXTRA_SPEED) ?: "—"
-
             when (state) {
-                ProxyVpnService.STATE_CONNECTED -> {
-                    isConnected = true
-                    updateConnectedUI(addr, ping, speed)
-                }
-                ProxyVpnService.STATE_DISCONNECTED -> {
-                    isConnected = false
-                    updateDisconnectedUI()
-                }
+                ProxyVpnService.STATE_CONNECTED    -> { isConnected = true;  isConnecting = false; updateConnectedUI(addr, ping, speed) }
+                ProxyVpnService.STATE_DISCONNECTED -> { isConnected = false; isConnecting = false; updateDisconnectedUI() }
             }
         }
     }
@@ -73,7 +66,6 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-
         setupRecycler()
         setupButtons()
         requestNotifPermission()
@@ -82,6 +74,25 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         registerReceiver(stateReceiver, IntentFilter(ProxyVpnService.BROADCAST_STATE), Context.RECEIVER_NOT_EXPORTED)
+
+        // Sync UI with actual service state — fixes the case where the activity
+        // was paused during the VPN permission dialog and missed the broadcast.
+        when {
+            ProxyVpnService.isRunning -> {
+                isConnected  = true
+                isConnecting = false
+                updateConnectedUI(ProxyVpnService.lastAddr, ProxyVpnService.lastPing, ProxyVpnService.lastSpeed)
+            }
+            isConnecting -> {
+                // Still waiting for the service — keep spinner visible
+                setConnectingUI(true)
+            }
+            else -> {
+                isConnected = false
+                // Only reset to disconnected UI if we weren't in mid-scan
+                if (!binding.btnScan.isEnabled.not()) updateDisconnectedUI()
+            }
+        }
     }
 
     override fun onPause() {
@@ -106,50 +117,48 @@ class MainActivity : AppCompatActivity() {
     private fun setupButtons() {
         binding.btnScan.setOnClickListener { scanProxies() }
         binding.btnConnect.setOnClickListener {
-            if (isConnected) disconnect() else connect()
+            if (isConnected) disconnect() else if (!isConnecting) connect()
         }
     }
 
     private fun requestNotifPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED
-            ) notifPermLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED)
+                notifPermLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
     // ─── Scan ─────────────────────────────────────────────────────────────────
 
     private fun scanProxies() {
-        binding.btnScan.isEnabled    = false
-        binding.btnConnect.isEnabled = false
-        binding.progressBar.visibility = View.VISIBLE
+        binding.btnScan.isEnabled       = false
+        binding.btnConnect.isEnabled    = false
+        binding.progressBar.visibility  = View.VISIBLE
         binding.tvScanStatus.visibility = View.VISIBLE
-        binding.tvScanStatus.text = "Fetching proxy lists…"
+        binding.tvScanStatus.text       = "Fetching proxy lists…"
         binding.proxyListCard.visibility = View.GONE
 
         lifecycleScope.launch {
             try {
-                val raw = fetcher.fetchProxies()
+                val raw  = fetcher.fetchProxies()
                 binding.tvScanStatus.text = "Testing ${raw.size} proxies for speed…"
-
                 val best = ProxyTester.testAll(raw, topN = 10)
 
-                binding.progressBar.visibility  = View.GONE
-                binding.btnScan.isEnabled       = true
+                binding.progressBar.visibility = View.GONE
+                binding.btnScan.isEnabled      = true
 
                 if (best.isEmpty()) {
                     binding.tvScanStatus.text = "No live proxies found. Try again."
                     return@launch
                 }
 
-                binding.tvScanStatus.text = "Found ${best.size} live proxies  •  Fastest: ${best.first().latencyMs}ms"
+                binding.tvScanStatus.text     = "Found ${best.size} live proxies  •  Fastest: ${best.first().latencyMs}ms"
                 adapter.submitList(best)
-                pendingProxy = best.first()
-                binding.proxyListCard.visibility  = View.VISIBLE
-                binding.btnConnect.isEnabled      = true
-                binding.btnConnect.text           = "Connect"
-
+                pendingProxy                  = best.first()
+                binding.proxyListCard.visibility = View.VISIBLE
+                binding.btnConnect.isEnabled  = !isConnected
+                binding.btnConnect.text       = "Connect"
             } catch (e: Exception) {
                 binding.progressBar.visibility = View.GONE
                 binding.btnScan.isEnabled      = true
@@ -162,9 +171,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun connect() {
         val proxy = pendingProxy ?: adapter.getSelected() ?: return
+        pendingProxy  = proxy
+        isConnecting  = true
+        setConnectingUI(true)
+
         val vpnIntent = VpnService.prepare(this)
         if (vpnIntent != null) {
-            vpnPermLauncher.launch(vpnIntent)
+            vpnPermLauncher.launch(vpnIntent)   // activity pauses here — static flag saves us on resume
         } else {
             startVpnService(proxy)
         }
@@ -172,7 +185,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun disconnect() {
         stopService(Intent(this, ProxyVpnService::class.java))
-        // UI update will come via broadcast
+        // UI update arrives via STATE_DISCONNECTED broadcast
     }
 
     private fun startVpnService(proxy: Proxy) {
@@ -188,15 +201,30 @@ class MainActivity : AppCompatActivity() {
 
     // ─── UI State ─────────────────────────────────────────────────────────────
 
-    private fun updateConnectedUI(addr: String, pingMs: Long, speed: String) {
-        binding.statusCard.visibility = View.VISIBLE
-        binding.tvStatus.apply {
-            text      = "● Connected"
-            setTextColor(Color.parseColor("#2E7D32"))
+    /** Shows spinner + "Connecting…" button while VPN is being established. */
+    private fun setConnectingUI(connecting: Boolean) {
+        if (connecting) {
+            binding.progressBar.visibility = View.VISIBLE
+            binding.btnConnect.apply {
+                text      = "Connecting…"
+                isEnabled = false
+                setBackgroundColor(Color.parseColor("#757575"))
+            }
+            binding.btnScan.isEnabled = false
+        } else {
+            binding.progressBar.visibility = View.GONE
+            binding.btnScan.isEnabled      = true
         }
+    }
+
+    private fun updateConnectedUI(addr: String, pingMs: Long, speed: String) {
+        setConnectingUI(false)
+        binding.statusCard.visibility = View.VISIBLE
+        binding.tvStatus.apply { text = "● Connected"; setTextColor(Color.parseColor("#2E7D32")) }
         binding.tvProxyAddr.text = addr
         binding.tvPing.text      = "${pingMs}ms"
         binding.tvSpeed.text     = speed
+        binding.tvScanStatus.text = "Connected  •  $addr"
         binding.btnConnect.apply {
             text      = "Disconnect"
             setBackgroundColor(Color.parseColor("#C62828"))
@@ -205,11 +233,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateDisconnectedUI() {
+        setConnectingUI(false)
         binding.statusCard.visibility = View.GONE
-        binding.tvStatus.apply {
-            text      = "● Disconnected"
-            setTextColor(Color.parseColor("#C62828"))
-        }
+        binding.tvStatus.apply { text = "● Disconnected"; setTextColor(Color.parseColor("#C62828")) }
+        binding.tvScanStatus.text = "Tap Scan to find fastest proxies"
         binding.btnConnect.apply {
             text      = "Connect"
             setBackgroundColor(Color.parseColor("#1565C0"))

@@ -30,31 +30,28 @@ class ProxyVpnService : VpnService() {
         const val EXTRA_SPEED        = "speed"
         const val EXTRA_PROXY_ADDR   = "proxy_addr"
 
-        // Sophos packages — excluded so Sophos bypasses VPN and doesn't block it
         private val SOPHOS_PACKAGES = listOf(
             "com.sophos.smsec",
             "com.sophos.endpoint.nativeagent",
             "com.sophos.mobilecontrol.client.android",
             "com.sophos.intercept.x.endpoint"
         )
-
-        // Gaming MTU: 1400 avoids fragmentation through proxy tunnel overhead.
-        // Standard 1500 causes packets to be split → higher effective ping.
         private const val GAMING_MTU = 1400
+
+        @Volatile var isRunning  = false
+        @Volatile var lastAddr   = ""
+        @Volatile var lastPing   = 0L
+        @Volatile var lastSpeed  = "—"
+        @Volatile var lastProto  = "http"
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private val serviceScope  = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var statsJob: Job? = null
-
     private var currentProxy: Proxy? = null
     private var currentPingMs: Long   = 0
-    private var connectTime: Long     = 0
 
-    override fun onCreate() {
-        super.onCreate()
-        createNotificationChannel()
-    }
+    override fun onCreate() { super.onCreate(); createNotificationChannel() }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
@@ -66,9 +63,10 @@ class ProxyVpnService : VpnService() {
 
         currentProxy  = Proxy(ip, port, prot, latencyMs = ping, isAlive = true)
         currentPingMs = ping
-        connectTime   = System.currentTimeMillis()
 
-        startForeground(NOTIF_ID, buildNotification(ip, port, ping, "—"))
+        isRunning = true; lastAddr = "$ip:$port"; lastPing = ping; lastSpeed = "—"; lastProto = prot
+
+        startForeground(NOTIF_ID, buildNotification(ip, port, prot, ping, "—"))
         establishVpn(ip, port)
         startStatsLoop()
         broadcastState(STATE_CONNECTED, ip, port, ping, "—")
@@ -76,7 +74,9 @@ class ProxyVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        isRunning = false
         serviceScope.cancel()
+        stopForeground(STOP_FOREGROUND_REMOVE)
         teardownVpn()
         broadcastState(STATE_DISCONNECTED)
         super.onDestroy()
@@ -90,11 +90,9 @@ class ProxyVpnService : VpnService() {
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
-                .setMtu(GAMING_MTU)   // 1400 — avoids tunnel fragmentation
+                .setMtu(GAMING_MTU)
                 .setBlocking(false)
 
-            // Exclude Sophos — lets it reach its servers directly so it
-            // doesn't detect VPN as an MDM policy violation
             for (pkg in SOPHOS_PACKAGES) {
                 try { builder.addDisallowedApplication(pkg) } catch (_: Exception) {}
             }
@@ -107,9 +105,7 @@ class ProxyVpnService : VpnService() {
 
             vpnInterface?.close()
             vpnInterface = builder.establish()
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (e: Exception) { e.printStackTrace() }
     }
 
     private fun teardownVpn() {
@@ -121,12 +117,11 @@ class ProxyVpnService : VpnService() {
         statsJob?.cancel()
         statsJob = serviceScope.launch {
             while (isActive) {
-                // 30s interval — measuring every 10s adds jitter during gameplay
                 delay(30_000)
                 val proxy = currentProxy ?: break
                 val (ping, speedLabel) = measureStats(proxy)
-                currentPingMs = ping
-                updateNotification(proxy.ip, proxy.port, ping, speedLabel)
+                currentPingMs = ping; lastPing = ping; lastSpeed = speedLabel
+                updateNotification(proxy.ip, proxy.port, proxy.protocol, ping, speedLabel)
                 broadcastState(STATE_CONNECTED, proxy.ip, proxy.port, ping, speedLabel)
             }
         }
@@ -135,66 +130,60 @@ class ProxyVpnService : VpnService() {
     private fun measureStats(proxy: Proxy): Pair<Long, String> {
         return try {
             val start = System.currentTimeMillis()
-            // protect() so these sockets don't loop back into the VPN tunnel
+            // Use the same protocol that was used to connect — HTTPS if DPI bypass mode
             val sock = when (proxy.protocol) {
+                "https"  -> Socks5Client.connectViaHttpsProxy(
+                    proxy.ip, proxy.port, "www.gstatic.com", 80, 6_000, vpnService = this)
                 "socks5" -> Socks5Client.connectViaSocks5(
-                    proxy.ip, proxy.port, "www.gstatic.com", 80, 6_000, vpnService = this
-                )
+                    proxy.ip, proxy.port, "www.gstatic.com", 80, 6_000, vpnService = this)
                 else     -> Socks5Client.connectViaHttpProxy(
-                    proxy.ip, proxy.port, "www.gstatic.com", 80, 6_000, vpnService = this
-                )
+                    proxy.ip, proxy.port, "www.gstatic.com", 80, 6_000, vpnService = this)
             }
             sock.use {
                 val req = "GET /generate_204 HTTP/1.1\r\nHost: www.gstatic.com\r\nConnection: close\r\n\r\n"
                 it.getOutputStream().apply { write(req.toByteArray()); flush() }
-
-                val buf = ByteArray(4096)
-                var total = 0
+                val buf = ByteArray(4096); var total = 0
                 val t0 = System.currentTimeMillis()
-                while (true) {
-                    val n = it.getInputStream().read(buf)
-                    if (n == -1) break
-                    total += n
-                }
+                while (true) { val n = it.getInputStream().read(buf); if (n == -1) break; total += n }
                 val elapsed = (System.currentTimeMillis() - t0).coerceAtLeast(1)
-                val kbps    = total * 1000L / elapsed
-                Pair(System.currentTimeMillis() - start, formatSpeed(kbps))
+                Pair(System.currentTimeMillis() - start, formatSpeed(total * 1000L / elapsed))
             }
-        } catch (_: Exception) {
-            Pair(currentPingMs, "—")
-        }
+        } catch (_: Exception) { Pair(currentPingMs, "—") }
     }
 
-    private fun formatSpeed(kbps: Long): String = when {
+    private fun formatSpeed(kbps: Long) = when {
         kbps <= 0   -> "—"
         kbps < 1024 -> "$kbps KB/s"
         else        -> "${"%.1f".format(kbps / 1024.0)} MB/s"
     }
 
+    private fun protoIcon(protocol: String) = when (protocol) {
+        "https"  -> "🔒"
+        "socks5" -> "🧦"
+        else     -> "🌐"
+    }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val ch = NotificationChannel(CHANNEL_ID, "ProxyBypass VPN", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "Shows proxy connection status"
-                setShowBadge(false)
+                description = "Shows proxy connection status"; setShowBadge(false)
             }
             getSystemService(NotificationManager::class.java)?.createNotificationChannel(ch)
         }
     }
 
-    private fun buildNotification(ip: String, port: Int, pingMs: Long, speed: String): Notification {
+    private fun buildNotification(ip: String, port: Int, protocol: String, pingMs: Long, speed: String): Notification {
         val mainIntent = PendingIntent.getActivity(
-            this, 0,
-            packageManager.getLaunchIntentForPackage(packageName),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+            this, 0, packageManager.getLaunchIntentForPackage(packageName),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val stopIntent = PendingIntent.getBroadcast(
             this, 0,
             Intent(this, NotificationActionReceiver::class.java).apply { action = ACTION_STOP },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val icon = protoIcon(protocol)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setContentTitle("🎮 ProxyBypass Connected")
+            .setContentTitle("🎮 ProxyBypass  $icon ${protocol.uppercase()}")
             .setContentText("$ip:$port  •  Ping: ${pingMs}ms  •  $speed")
             .setSubText("Tap to open app")
             .setContentIntent(mainIntent)
@@ -205,8 +194,8 @@ class ProxyVpnService : VpnService() {
             .build()
     }
 
-    private fun updateNotification(ip: String, port: Int, pingMs: Long, speed: String) {
-        getSystemService(NotificationManager::class.java)?.notify(NOTIF_ID, buildNotification(ip, port, pingMs, speed))
+    private fun updateNotification(ip: String, port: Int, protocol: String, pingMs: Long, speed: String) {
+        getSystemService(NotificationManager::class.java)?.notify(NOTIF_ID, buildNotification(ip, port, protocol, pingMs, speed))
     }
 
     private fun broadcastState(state: String, ip: String = "", port: Int = 0, ping: Long = 0, speed: String = "") {

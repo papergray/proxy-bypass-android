@@ -9,4 +9,5 @@ data class Proxy(
 ) {
     val address: String get() = "$ip:$port"
     val label: String   get() = protocol.uppercase()
+    fun latencyLabel(): String = "${latencyMs}ms"
 }
